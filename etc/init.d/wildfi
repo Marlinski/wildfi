@@ -1,0 +1,283 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          wildfi
+# Required-Start:    $local_fs $remote_fs $network $syslog
+# Required-Stop:     $local_fs $remote_fs $network $syslog
+# Default-Start:     
+# Default-Stop:      0 1 6
+# X-Interactive:     true
+# Short-Description: Start/stop a wireless access point 
+### END INIT INFO
+
+# Author: Lucien Loiseau <loiseau.lucien@gmail.com>
+#
+# This script will start/stop a wireless access point
+# a DHCP server and will set a captive portal 
+#
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+DESC="Wild-Fi - wild wireless access point"
+WILDFI_LOG=/var/log/wild/init.log
+
+# set VERBOSE to "no" if you don't want the verbose output
+VERBOSE="y"
+wild_echo(){
+  TXT=$1
+  [ "$VERBOSE" != no ] && echo -n $TXT || echo -n $TXT >> $WILDFI_LOG
+}
+
+ETCDIR=/etc/wildfi
+LOGDIR=/var/log/wildfi
+RUNDIR=/var/run/wildfi
+
+HOSTAPD_CONF=$ETCDIR/hostapd.conf
+HOSTAPD_PID=$RUNDIR/hostapd.pid
+HOSTAPD_LOG=$LOGDIR/hostapd.log
+HOSTAPD=
+DNSMASQ_CONF=$ETCDIR/dnsmasq.conf
+DNSMASQ_OLD_CONF=$ETCDIR/dnsmasq.old.conf
+DNSMASQ_PID=$RUNDIR/hostapd.pid
+DNSMASQ_LOG=$LOGDIR/dnsmasq.log
+DNSMASQ=
+LOG80211_LOG=$LOGDIR/log80211.log
+LOG80211_PID=$RUNDIR/log80211.pid
+
+if [ -z $HOSTAPD]
+then
+  wild_echo "looking for hostapd.. "
+  which hostapd 1>/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then 
+    wild_echo "OK\n"
+    HOSTAPD=$(which hostapd)
+  else 
+    wild_echo "FAIL - hostapd not found or not installed\n"
+    exit 1
+  fi
+fi
+
+if [ -z $DNSMASQ ]
+then
+  wild_echo "looking for dnsmask.. "
+  which dnsmasq 1>/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    wild_echo "OK\n"
+    DNSMASQ=$(which dnsmasq)
+  else
+    wild_echo "FAIL - dnsmasq not found or not installed\n"
+    exit 1
+  fi
+fi
+
+wild_echo "looking for configuration files.. "
+[ -r $HOSTAPD_CONF ] && [ -r $DNSMASQ_CONF ] && wild_echo "OK\n" || wild_echo "FAIL - not found or no read permission for $HOSTAPD_CONF and $DNSMASQ_CONF\n"
+
+do_start()
+{
+  # launch hostapd
+  wild_echo " [+] running hostapd.. "
+  hostapd -dd -P $HOSTAPD_PID -B -t $HOSTAPD_CONF > $HOSTAPD_LOG 2>&1
+  if [ $? -eq 0 ]
+  then
+    wild_echo "OK\n"
+  else
+    wild_echo "FAIL - check $HOSTAPD_LOG for details\n"
+    exit 1
+  fi
+
+  # getting Iface Address and Netmask from configuration
+  IFACE=$(cat $HOSTAPD_CONF | grep "^interface=" | cut -d"=" -f2)
+  # running log 
+
+  nohup /usr/bin/wildfi-80211-log $IFACE $LOG80211_LOG $LOG80211_PID >/dev/null 2>&1 &
+
+  ADDRESS=$(cat $DNSMASQ_CONF | grep address | awk -F"/" '{print $3;}')
+  NETMASK=$(cat $DNSMASQ_CONF | grep range | awk -F"," '{print $3;}')
+  wild_echo " [+] configuring ip network.. "
+  ifconfig $IFACE $ADDRESS netmask $NETMASK up 2>/dev/null
+  if [ $? -eq 0 ]
+  then
+    wild_echo "OK\n"
+  else
+    wild_echo "FAIL - could not set iface $IFACE with address $ADDRESS and netmask $NETMASK\n"
+    do_stop_hostapd
+    exit 1
+  fi
+
+  wild_echo " [+] checking dnsmasq configuration file.. "
+  dnsmasq --test $DNSMASQ_CONF >> $DNSMASQ_LOG 2>&1
+  if [ $? -eq 0 ]
+  then 
+    wild_echo "OK\n"
+  else
+    wild_echo "FAIL - check $DNSMASQ_LOG for details\n"
+    do_stop_hostapd
+    exit 1
+  fi
+
+  # backuping dnsmasq configuration
+  /etc/init.d/dnsmasq status >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    wild_echo "[-] dnsmasq already running, killing current instance first\n"
+    do_stop_dnsmasq
+  fi
+
+  lsof -n -i -a | grep domain
+  if [ $? -eq 0 ]
+  then
+    wild_echo "[-] port 53 not available, kill current instance ? [y/n] "
+    read ANSWER
+    if [ "$ANSWER" = y ]
+    then
+      for PID in $(lsof -n -i -a | grep domain | awk '{print $2;}' | sort -u) 
+      do
+        wild_echo "[-] killing.. $PID"
+        kill $PID
+        if [ $? -eq 0 ]
+          then wild_echo "OK\n"
+        else 
+          wild_echo "FAIL\n"
+          do_stop_hostapd
+          exit 1
+        fi
+      done
+    else
+      do_stop_hostapd
+      exit 1
+    fi
+  fi
+
+  if [ -f /etc/dnsmasq.conf ]; then mv -f /etc/dnsmasq.conf $DNSMASQ_OLD_CONF >/dev/null 2>&1; fi
+  cp -f $DNSMASQ_CONF /etc/dnsmasq.conf
+
+  wild_echo "[+] running dnsmasq.. "
+  /etc/init.d/dnsmasq start >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then 
+    wild_echo "OK\n"
+  else
+    wild_echo "FAIL - check syslog for details\n"
+    do_stop_hostapd
+    exit 1
+  fi
+
+  wild_echo "[+] setting captive portal.."
+  /sbin/iptables --table nat -A PREROUTING -p udp --dport 53 -j DNAT --to $ADDRESS
+  if [ $? -eq 0 ]
+  then
+    wild_echo "OK\n"
+  else
+    wild_echo "FAIL to set iptables\n"
+    do_stop_dnsmasq
+    do_stop_hostapd
+    exit 1
+  fi
+}
+
+
+do_stop_dnsmasq()
+{
+  wild_echo "[-] stopping dnsmasq.. "
+  /etc/init.d/dnsmasq status >/dev/null 2>&1
+  if [ $? -eq 0 ]
+  then
+    /etc/init.d/dnsmasq stop >/dev/null 2>&1
+    if [ $? -eq 0 ]
+    then
+      wild_echo "OK\n"
+    else
+      wild_echo "FAIL to stop dnsmasq with init script\n"
+    fi
+  else
+    killall dnsmasq >/dev/null 2>&1
+    if [ $? -eq 0 ]
+    then
+      wild_echo "OK\n"
+    else
+      wild_echo "dnsmasq already stopped\n"
+    fi
+  fi
+  if [ -f $DNSMASQ_OLD_CONF ]; then mv -f $DNSMASQ_OLD_CONF /etc/dnsmasq.conf >/dev/null 2>&1; fi
+}
+
+do_stop_hostapd()
+{
+  wild_echo "[-] stopping hostapd.. "
+  if [ -f $HOSTAPD_PID ]
+  then
+    kill $(cat $HOSTAPD_PID) >/dev/null 2>&1
+    if [ $? -eq 0 ] 
+    then wild_echo "OK"
+    else 
+      wild_echo "cant kill pid $(cat $HOSTAPD_PID) - killing all hostapd instance - "
+      killall hostapd >/dev/null 2>&1
+      if [ $? -eq 0 ]; then wild_echo "OK\n"; else wild_echo "FAIL\n"; fi
+    fi
+  else
+    wild_echo "no pid file found, killing all hostapd instance - "
+    killall hostapd >/dev/null 2>&1
+    if [ $? -eq 0 ]; then wild_echo "OK\n"; else wild_echo "FAIL\n"; fi
+  fi
+  kill $(cat $LOG80211_PID) > /dev/null 2>&1
+}
+
+
+do_stop()
+{
+  do_stop_dnsmasq
+  do_stop_hostapd
+  wild_echo "[-] unsetting captive portal.."
+  for i in {1..$(/sbin/iptables --table nat -L -n --line-numbers | grep DNAT | grep "udp dpt:53" | wc -l)}
+  do
+    RULE=$(/sbin/iptables --table nat -L -n --line-numbers | grep DNAT | grep "udp dpt:53" | awk '{print $1;}' | head -n 1)
+    /sbin/iptables --table nat -D PREROUTING $RULE >/dev/null 2>&1
+  done
+  wild_echo "OK\n"
+}
+
+case "$1" in
+  start)
+    wild_echo "Starting $DESC \n"
+    do_start
+    case "$?" in
+      0) wild_echo "[done]\n";;
+      1) wild_echo "[fail]\n";;
+    esac
+    ;;
+  stop)
+    wild_echo "Stopping $DESC \n"
+    do_stop
+    case "$?" in
+      0) wild_echo "[done]\n";;
+      1) wild_echo "[fail]\n";;
+    esac
+    ;;
+  restart|force-reload)
+    wild_echo "Restarting $DESC \n"
+    do_stop
+    case "$?" in
+      0)
+        do_start
+        case "$?" in
+          0) wild_echo "[done]\n" ;;
+          1) wild_echo "[fail]\n" ;;
+        esac
+        ;;
+      1) wild_echo "[fail]\n" ;;
+    esac
+    ;;
+  *) 
+    echo "Usage: $SCRIPTNAME {start|stop|restart|force-reload}" >&2
+    exit 3
+    ;;
+esac
+
+:
+
+
+
+
+
+

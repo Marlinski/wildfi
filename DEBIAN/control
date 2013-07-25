@@ -1,0 +1,8 @@
+Package: wildfi
+Version: 1.0
+Section: base
+Priority: optional
+Architecture: all
+Depends: bash, dnsmasq, hostapd
+Maintainer: Lucien Loiseau <loiseau.lucien@gmail.com>
+Description: create and configure a wireless access point with a captive portal

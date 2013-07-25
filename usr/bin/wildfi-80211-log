@@ -1,0 +1,17 @@
+#!/bin/bash
+
+IFACE=$1
+LOG80211_LOG=$2
+LOG80211_PID=$3
+
+echo "$$" > $LOG80211_PID
+
+while true; do
+  echo $(date +%H:%M:%S) $(iw dev $IFACE station dump) >> $LOG80211_LOG
+  sleep 1
+done
+
+
+
+
+
